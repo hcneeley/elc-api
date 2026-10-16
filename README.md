@@ -82,23 +82,6 @@ python earthlife_consortium_api.py
 
 Writes summaries, CSV, and plots under `output/`.
 
-## Mindat (optional)
-
-Mindat is **off by default**. When your Mindat account is approved for API use, put this in a local `key.env` (never commit it):
-
-```env
-MINDAT_ENABLED=true
-MINDAT_API_KEY=your_token_here
-```
-
-On Mac, Finder may not allow naming a file `.env`; `key.env` is supported.
-
-## Deploy (Render)
-
-See `render.yaml`. Set secrets in the Render dashboard; do not commit API keys.
-
-Current production service: https://elc-api-i83q.onrender.com
-
 ## Endpoints
 
 | Path | Description |
