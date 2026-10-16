@@ -1,0 +1,22 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: push this repo to GitHub, then in Render:
+#   New → Blueprint → select the repo
+services:
+  - type: web
+    name: elc-api
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements-api.txt
+    startCommand: gunicorn elc_server.app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    healthCheckPath: /api_v1/
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      # Mindat off by default; enable in Render when the account works
+      - key: MINDAT_ENABLED
+        value: "false"
+      - key: MINDAT_API_KEY
+        sync: false
