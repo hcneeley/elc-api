@@ -39,7 +39,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 
 from . import adapters
-from .env import load_dotenv, mindat_configured, mindat_enabled
+from .env import load_dotenv, mindat_configured, mindat_enabled, mindat_key_status
 
 load_dotenv()
 
@@ -145,6 +145,7 @@ def index():
             "backends": backends,
             "mindat_enabled": mindat_enabled(),
             "mindat_configured": mindat_configured(),
+            **mindat_key_status(),
             "endpoints": {
                 "occurrences": "/api_v1/occ?taxon=Canis+dirus&limit=50",
                 "taxonomy": "/api_v1/tax?taxon=Canis+dirus",
@@ -515,16 +516,22 @@ def minerals():
     if not name:
         return jsonify({"detail": "Parameter required: name", "status": 400}), 400
     if not mindat_configured():
+        if not mindat_enabled():
+            detail = "Mindat is disabled (MINDAT_ENABLED=false)."
+            hint = "Set MINDAT_ENABLED=true in the Render environment (or key.env locally)."
+        else:
+            detail = "Mindat is enabled but MINDAT_API_KEY is missing."
+            hint = (
+                "In Render → Environment, add secret MINDAT_API_KEY with your Mindat token, "
+                "then redeploy. Locally: put MINDAT_API_KEY=… in key.env."
+            )
         return jsonify(
             {
-                "detail": "Mindat is currently disabled in this API.",
+                "detail": detail,
                 "status": 503,
                 "mindat_enabled": mindat_enabled(),
-                "hint": (
-                    "When your Mindat account is active, add to key.env:\n"
-                    "MINDAT_ENABLED=true\n"
-                    "(and keep your token in key.env)"
-                ),
+                "mindat_configured": False,
+                "hint": hint,
             }
         ), 503
 
