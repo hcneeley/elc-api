@@ -15,8 +15,8 @@ services:
         value: "3.11.9"
       - key: WEB_CONCURRENCY
         value: "2"
-      # Mindat off by default; enable in Render when the account works
+      # Mindat on for this branch; still needs MINDAT_API_KEY secret in Render
       - key: MINDAT_ENABLED
-        value: "false"
+        value: "true"
       - key: MINDAT_API_KEY
         sync: false

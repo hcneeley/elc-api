@@ -51,11 +51,12 @@ def mindat_api_key() -> str | None:
 
 def mindat_enabled() -> bool:
     """
-    Mindat is opt-in. Default OFF until the Mindat account/API access works.
-    Enable later with MINDAT_ENABLED=true in key.env / environment.
+    Mindat is on by default on this branch.
+    Disable with MINDAT_ENABLED=false in key.env / environment.
+    Still requires MINDAT_API_KEY for queries to succeed.
     """
     load_dotenv()
-    flag = os.environ.get("MINDAT_ENABLED", "false").strip().lower()
+    flag = os.environ.get("MINDAT_ENABLED", "true").strip().lower()
     return flag in {"1", "true", "t", "yes", "y", "on"}
 
 
