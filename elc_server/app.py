@@ -3,21 +3,26 @@
 Local Earth-Life Consortium–compatible API.
 
 Composites Paleobiology Database (PBDB), Neotoma Paleoecology Database,
-and (optionally) Mindat mineral data into a unified JSON response shaped
-like the original ELC API (https://github.com/EarthLifeConsortium/elc_api).
+(optionally) Mindat mineral data, and ePANDDA (PBDB + iDigBio) into a
+unified JSON response shaped like the original ELC API
+(https://github.com/EarthLifeConsortium/elc_api).
 
 Mindat requires MINDAT_API_KEY in key.env or .env (see .env.example).
 Mindat query patterns follow https://github.com/ChuBL/How-to-Use-Mindat-API
+
+ePANDDA docs: https://epandda.org/documentation_2.html
+When api.epandda.org is unreachable, /epandda composes PBDB + iDigBio locally.
 
 Run:
     python -m elc_server.app
     # → http://127.0.0.1:8008/api_v1/
 
 Endpoints:
-    GET /api_v1/occ        fossil occurrences (+ Mindat localities if run includes mindat)
+    GET /api_v1/occ        fossil occurrences (+ Mindat / ePANDDA via run=)
     GET /api_v1/tax        taxonomy
     GET /api_v1/loc        locales / collections (+ Mindat localities)
     GET /api_v1/minerals   Mindat geomaterials search
+    GET /api_v1/epandda    ePANDDA-shaped PBDB + iDigBio correlated results
     GET /api_v1/misc/timebound   resolve geologic age bounds via PBDB
 """
 
@@ -73,12 +78,12 @@ def _run_list(run: str | None, *, default: list[str] | None = None) -> list[str]
     """
     Parse run=… into backend names.
     default: used when run is omitted (fossil endpoints → neotoma+pbdb).
-    run=all → neotoma, pbdb, and mindat (if a key is configured).
+    run=all → neotoma, pbdb, epandda, and mindat (if a key is configured).
     """
     if not run:
         return list(default or ["neotoma", "pbdb"])
     if run.strip().lower() == "all":
-        dbs = ["neotoma", "pbdb"]
+        dbs = ["neotoma", "pbdb", "epandda"]
         if mindat_configured():
             dbs.append("mindat")
         return dbs
@@ -116,7 +121,7 @@ def save_last_occurrences(payload: dict[str, Any]) -> None:
 @app.get("/api_v1/")
 @app.get("/api_v1")
 def index():
-    backends = ["pbdb", "neotoma"]
+    backends = ["pbdb", "neotoma", "epandda"]
     if mindat_configured():
         backends.append("mindat")
     return jsonify(
@@ -132,6 +137,8 @@ def index():
                 "locales": "/api_v1/loc?taxon=Canis+dirus&limit=50",
                 "minerals": "/api_v1/minerals?name=quartz&limit=20",
                 "mindat_localities": "/api_v1/loc?taxon=quartz&run=mindat&limit=20",
+                "epandda": "/api_v1/epandda?terms=hadrosaurus&limit=25",
+                "epandda_via_occ": "/api_v1/occ?taxon=hadrosaurus&run=epandda&limit=25",
                 "timebound": "/api_v1/misc/timebound?agerange=pleistocene",
             },
         }
@@ -211,6 +218,17 @@ def occurrences():
             except Exception as exc:  # noqa: BLE001
                 errors["mindat"] = str(exc)
                 meta["mindat"] = {"record_count": 0, "error": str(exc)}
+
+    if "epandda" in dbs:
+        try:
+            rows, m = adapters.fetch_epandda_occurrences(
+                taxon, limit=limit, ageunits=ageunits
+            )
+            records.extend(rows)
+            meta["epandda"] = m
+        except Exception as exc:  # noqa: BLE001
+            errors["epandda"] = str(exc)
+            meta["epandda"] = {"record_count": 0, "error": str(exc)}
 
     if errors:
         meta["errors"] = errors
@@ -330,6 +348,50 @@ def locales():
     if show == "poll":
         return jsonify(meta)
     return jsonify(metadata=meta, records=records)
+
+
+@app.get("/api_v1/epandda")
+def epandda():
+    """
+    ePANDDA-compatible correlated PBDB + iDigBio results.
+    Docs: https://epandda.org/documentation_2.html
+    Primary param: terms= (e.g. hadrosaurus or genus:hadrosaurus|country:canada)
+    """
+    terms = request.args.get("terms") or request.args.get("taxon")
+    if not terms:
+        return jsonify(
+            {
+                "detail": "Parameter required: terms (e.g. hadrosaurus or genus:hadrosaurus)",
+                "status": 400,
+                "docs": "https://epandda.org/documentation_2.html",
+            }
+        ), 400
+
+    limit = abs(int(request.args.get("limit") or 25))
+    return_media = _truthy(request.args.get("returnMedia"), False)
+    try:
+        payload, meta = adapters.fetch_epandda_raw(
+            terms,
+            limit=limit,
+            return_media=return_media,
+            chrono_match_level=request.args.get("chronoMatchLevel"),
+            taxon_match_level=request.args.get("taxonMatchLevel"),
+            locality_match_level=request.args.get("localityMatchLevel"),
+            match_on=request.args.get("matchOn"),
+            geo_point_fields=request.args.get("geoPointFields"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"detail": str(exc), "status": 502}), 502
+
+    append_request_log(
+        "/api_v1/epandda",
+        {"terms": terms, "limit": limit, "mode": meta.get("mode")},
+        len(payload.get("results") or []),
+    )
+    # Attach local metadata without breaking ePANDDA response shape
+    out = dict(payload)
+    out["_elc_meta"] = meta
+    return jsonify(out)
 
 
 @app.get("/api_v1/minerals")

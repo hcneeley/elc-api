@@ -1,8 +1,9 @@
-"""Fetch + normalize records from PBDB, Neotoma, and Mindat into ELC-shaped objects."""
+"""Fetch + normalize records from PBDB, Neotoma, Mindat, and ePANDDA into ELC-shaped objects."""
 
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from time import time
 from typing import Any
 from urllib.parse import urlencode
@@ -15,7 +16,11 @@ from .env import mindat_api_key
 PBDB_BASE = "https://paleobiodb.org/data1.2/"
 NEOTOMA_BASE = "https://api.neotomadb.org/v2.0/data/"
 MINDAT_BASE = "https://api.mindat.org/v1/"
+# Official host (often DNS-dead); we fall back to a local PBDB + iDigBio composite.
+EPANDDA_BASE = "https://api.epandda.org/"
+IDIGBIO_BASE = "https://search.idigbio.org/v2/"
 TIMEOUT = 60
+EPANDDA_TIMEOUT = 15
 
 
 def _get(
@@ -680,5 +685,458 @@ def fetch_mindat_occurrences(
                 "elevation": loc.get("elevation"),
             }
         )
+    meta = {**meta, "record_count": len(records)}
+    return records, meta
+
+
+# ---------------------------------------------------------------------------
+# ePANDDA (PBDB + iDigBio correlation)
+# Docs: https://epandda.org/documentation_2.html
+# ---------------------------------------------------------------------------
+
+
+def _parse_epandda_terms(terms: str) -> dict[str, str]:
+    """
+    Parse ePANDDA terms=… (pipe-separated field:value, or bare taxon text).
+    Bare text → taxonomic search regardless of rank (genus-ish query string).
+    """
+    out: dict[str, str] = {}
+    for part in terms.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            field, value = part.split(":", 1)
+            out[field.strip().lower()] = value.strip()
+        else:
+            out["taxon"] = part
+    return out
+
+
+def _idigbio_search(
+    rq: dict[str, Any],
+    *,
+    limit: int,
+    return_media: bool = False,
+) -> tuple[list[dict[str, Any]], str, int]:
+    params: dict[str, Any] = {
+        "rq": json.dumps(rq),
+        "limit": min(limit, 5000),
+        "offset": 0,
+    }
+    data, subquery = _get(IDIGBIO_BASE + "search/records", params)
+    items = data.get("items") or []
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        idx = item.get("indexTerms") or {}
+        raw = item.get("data") or {}
+        uuid = item.get("uuid") or idx.get("uuid")
+        row: dict[str, Any] = {
+            "type": "idigbio",
+            "uuid": uuid,
+            "url": f"https://www.idigbio.org/portal/records/{uuid}" if uuid else None,
+            "dwc:scientificName": raw.get("dwc:scientificName")
+            or idx.get("canonicalname")
+            or idx.get("scientificname"),
+            "dwc:genus": raw.get("dwc:genus") or idx.get("genus"),
+            "dwc:family": raw.get("dwc:family") or idx.get("family"),
+            "dwc:order": raw.get("dwc:order") or idx.get("order"),
+            "dwc:class": raw.get("dwc:class") or idx.get("class"),
+            "dwc:phylum": raw.get("dwc:phylum") or idx.get("phylum"),
+            "dwc:kingdom": raw.get("dwc:kingdom") or idx.get("kingdom"),
+            "dwc:country": raw.get("dwc:country") or idx.get("country"),
+            "dwc:stateProvince": raw.get("dwc:stateProvince") or idx.get("stateprovince"),
+            "dwc:county": raw.get("dwc:county") or idx.get("county"),
+            "dwc:locality": raw.get("dwc:locality") or idx.get("locality"),
+            "dwc:formation": raw.get("dwc:formation") or idx.get("formation"),
+            "dwc:earliestPeriodOrLowestSystem": raw.get("dwc:earliestPeriodOrLowestSystem")
+            or idx.get("earliestperiodorlowestsystem"),
+            "dwc:latestPeriodOrHighestSystem": raw.get("dwc:latestPeriodOrHighestSystem")
+            or idx.get("latestperiodorhighestsystem"),
+            "dwc:basisOfRecord": raw.get("dwc:basisOfRecord") or idx.get("basisofrecord"),
+            "dwc:catalogNumber": raw.get("dwc:catalogNumber") or idx.get("catalognumber"),
+            "dwc:institutionCode": raw.get("dwc:institutionCode") or idx.get("institutioncode"),
+            "dwc:occurrenceID": raw.get("dwc:occurrenceID") or idx.get("occurrenceid"),
+            "idigbio:uuid": uuid,
+            "idigbio:hasMedia": str(idx.get("hasMedia", False)).lower(),
+            "idigbio:hasImage": str(idx.get("hasImage", False)).lower(),
+            "idigbio:geoPoint": idx.get("geopoint"),
+            "idigbio:isoCountryCode": idx.get("countrycode"),
+        }
+        if return_media:
+            row["idigbio:mediarecords"] = idx.get("mediarecords")
+        geo = idx.get("geopoint")
+        if isinstance(geo, dict):
+            row["lat"] = _f(geo.get("lat"))
+            row["lon"] = _f(geo.get("lon"))
+        rows.append(row)
+    return rows, subquery, int(data.get("itemCount") or len(rows))
+
+
+def _pbdb_epandda_occs(taxon: str, *, limit: int) -> tuple[list[dict[str, Any]], str, int]:
+    """PBDB occurrences shaped closer to ePANDDA source records."""
+    params: dict[str, Any] = {
+        "base_name": taxon,
+        "show": "full,coords,paleoloc,attr,class",
+        "limit": limit,
+    }
+    data, subquery = _get(PBDB_BASE + "occs/list.json", params)
+    raw = data.get("records") or []
+    rows: list[dict[str, Any]] = []
+    for rec in raw:
+        oid = (rec.get("oid") or "").replace("occ:", "") or rec.get("oid")
+        lat, lon = _f(rec.get("lat")), _f(rec.get("lng"))
+        geo = f"{lat},{lon}" if lat is not None and lon is not None else None
+        rows.append(
+            {
+                "type": "pbdb",
+                "occurrence_no": oid,
+                "collection_no": (rec.get("cid") or "").replace("col:", "") or rec.get("cid"),
+                "collection_name": rec.get("cnm") or rec.get("collection_name"),
+                "accepted_name": rec.get("tna") or rec.get("accepted_name"),
+                "genus": rec.get("gnl") or rec.get("genus"),
+                "family": rec.get("fml") or rec.get("family"),
+                "class": rec.get("cll") or rec.get("class"),
+                "phylum": rec.get("phl") or rec.get("phylum"),
+                "cc1": rec.get("cc1"),
+                "state": rec.get("stp") or rec.get("state"),
+                "county": rec.get("cny") or rec.get("county"),
+                "formation": rec.get("sfm") or rec.get("formation"),
+                "early_interval": rec.get("oei") or rec.get("early_interval"),
+                "late_interval": rec.get("oli") or rec.get("late_interval"),
+                "max_ma": rec.get("eag"),
+                "min_ma": rec.get("lag"),
+                "lat": lat,
+                "lng": lon,
+                "geoPoint": geo,
+                "paleolat": _f(rec.get("pla")),
+                "paleolng": _f(rec.get("pln")),
+                "url": (
+                    f"https://paleobiodb.org/data1.2/occs/single.json?id={oid}&show=full"
+                    if oid
+                    else None
+                ),
+            }
+        )
+    return rows, subquery, len(rows)
+
+
+def _epandda_match_key(genus: str | None, county: str | None, period: str | None) -> tuple:
+    return (
+        (genus or "").strip().lower() or None,
+        (county or "").strip().lower() or None,
+        (period or "").strip().lower() or None,
+    )
+
+
+def _compose_epandda_local(
+    terms: str,
+    *,
+    limit: int,
+    return_media: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Local recreation of ePANDDA when api.epandda.org is unreachable:
+    query PBDB + iDigBio and group approximate matches on genus / county / period.
+    """
+    t0 = time()
+    parsed = _parse_epandda_terms(terms)
+    taxon = (
+        parsed.get("taxon")
+        or parsed.get("genus")
+        or parsed.get("scientificname")
+        or parsed.get("family")
+        or terms
+    )
+    country = parsed.get("country")
+
+    if "genus" in parsed:
+        idig_rq: dict[str, Any] = {"genus": parsed["genus"]}
+    elif "scientificname" in parsed:
+        idig_rq = {"scientificname": parsed["scientificname"]}
+    elif " " not in taxon.strip():
+        idig_rq = {"genus": taxon}
+    else:
+        idig_rq = {"scientificname": taxon}
+    if country:
+        idig_rq["country"] = country
+
+    idig_rows, idig_url, idig_total = _idigbio_search(
+        idig_rq, limit=limit, return_media=return_media
+    )
+    pbdb_rows, pbdb_url, pbdb_total = _pbdb_epandda_occs(taxon, limit=limit)
+
+    # Bucket by match criteria (default ePANDDA: county + genus + period)
+    buckets: dict[tuple, dict[str, list]] = defaultdict(lambda: {"idigbio": [], "pbdb": []})
+    for row in idig_rows:
+        period = row.get("dwc:earliestPeriodOrLowestSystem") or row.get(
+            "dwc:latestPeriodOrHighestSystem"
+        )
+        key = _epandda_match_key(row.get("dwc:genus"), row.get("dwc:county"), period)
+        buckets[key]["idigbio"].append(row)
+    for row in pbdb_rows:
+        period = row.get("early_interval") or row.get("late_interval")
+        # PBDB intervals are stage names; also try formation-less period from early_interval word
+        key = _epandda_match_key(row.get("genus"), row.get("county"), period)
+        buckets[key]["pbdb"].append(row)
+
+    results: list[dict[str, Any]] = []
+    for key, sides in buckets.items():
+        genus, county, chrono = key
+        idig = sides["idigbio"]
+        pbdb = sides["pbdb"]
+        if not idig and not pbdb:
+            continue
+        # Prefer PBDB as source when both exist (documented pattern)
+        if pbdb and idig:
+            source_type, match_type = "pbdb", "idigbio"
+            sources, matches = pbdb, idig
+        elif pbdb:
+            source_type, match_type = "pbdb", "pbdb"
+            sources, matches = pbdb, pbdb[:0]
+        else:
+            source_type, match_type = "idigbio", "idigbio"
+            sources, matches = idig, idig[:0]
+
+        fields: dict[str, Any] = {}
+        if genus:
+            fields["genus"] = genus
+        if county:
+            fields["county"] = county
+        if chrono:
+            fields["chronostratigraphy"] = [chrono]
+
+        results.append(
+            {
+                "fields": fields,
+                "matchType": match_type,
+                "sourceType": source_type,
+                "matches": matches[:25],
+                "sources": sources[:25],
+                "totalMatches": len(matches) if matches else len(sources),
+            }
+        )
+
+    # Cap result groups
+    results = results[: max(1, min(limit, 50))]
+    payload = {
+        "queryInfo": {
+            "idigbioTotal": idig_total,
+            "pbdbTotal": pbdb_total,
+            "matchCriteria": {
+                "chronostratigraphyMatch": {
+                    "idigbio": {
+                        "early": "dwc:earliestPeriodOrLowestSystem",
+                        "late": "dwc:latestPeriodOrHighestSystem",
+                    },
+                    "pbdb": "early_interval",
+                },
+                "localityMatch": {"idigbio": "dwc:county", "pbdb": "county"},
+                "taxonomyMatch": {"idigbio": "dwc:genus", "pbdb": "genus"},
+            },
+            "mode": "local_composite",
+            "note": (
+                "api.epandda.org unreachable; composed from PBDB + iDigBio "
+                "(same pairing role as ePANDDA)"
+            ),
+        },
+        "results": results,
+    }
+    meta = {
+        "subquery": {"idigbio": idig_url, "pbdb": pbdb_url},
+        "response_time": round(time() - t0, 3),
+        "record_count": sum(
+            len(r.get("matches") or []) + len(r.get("sources") or []) for r in results
+        ),
+        "idigbio_total": idig_total,
+        "pbdb_total": pbdb_total,
+        "mode": "local_composite",
+        "terms": terms,
+    }
+    return payload, meta
+
+
+def fetch_epandda_raw(
+    terms: str,
+    *,
+    limit: int = 25,
+    return_media: bool = False,
+    chrono_match_level: str | None = None,
+    taxon_match_level: str | None = None,
+    locality_match_level: str | None = None,
+    match_on: str | None = None,
+    geo_point_fields: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Call official ePANDDA /occurrences when available; otherwise compose PBDB+iDigBio.
+    Response shape follows https://epandda.org/documentation_2.html
+    """
+    t0 = time()
+    params: dict[str, Any] = {"terms": terms}
+    if return_media:
+        params["returnMedia"] = "true"
+    if chrono_match_level:
+        params["chronoMatchLevel"] = chrono_match_level
+    if taxon_match_level:
+        params["taxonMatchLevel"] = taxon_match_level
+    if locality_match_level:
+        params["localityMatchLevel"] = locality_match_level
+    if match_on:
+        params["matchOn"] = match_on
+    if geo_point_fields:
+        params["geoPointFields"] = geo_point_fields
+
+    try:
+        resp = requests.get(
+            EPANDDA_BASE + "occurrences",
+            params=params,
+            timeout=EPANDDA_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results") or []
+        if isinstance(results, dict):
+            # Some versions return results as an object
+            results = list(results.values()) if results else []
+            data = {**data, "results": results}
+        meta = {
+            "subquery": resp.url,
+            "response_time": round(time() - t0, 3),
+            "record_count": len(results) if isinstance(results, list) else 0,
+            "mode": "remote",
+            "terms": terms,
+            "queryInfo": data.get("queryInfo"),
+        }
+        return data, meta
+    except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
+        payload, meta = _compose_epandda_local(
+            terms, limit=limit, return_media=return_media
+        )
+        meta["remote_error"] = str(exc)
+        meta["response_time"] = round(time() - t0, 3)
+        return payload, meta
+
+
+def flatten_epandda_to_elc(
+    payload: dict[str, Any],
+    *,
+    ageunits: str = "ma",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Flatten ePANDDA match groups into ELC-like occurrence rows for /occ."""
+    records: list[dict[str, Any]] = []
+    for group in payload.get("results") or []:
+        for src in group.get("sources") or []:
+            if len(records) >= limit:
+                return records
+            st = (group.get("sourceType") or src.get("type") or "pbdb").lower()
+            if st == "pbdb" or "occurrence_no" in src:
+                oid = src.get("occurrence_no")
+                records.append(
+                    {
+                        "db": "epandda/pbdb",
+                        "occ_id": f"pbdb:occ:{oid}" if oid else None,
+                        "taxon": src.get("accepted_name") or src.get("genus"),
+                        "taxon_id": None,
+                        "max_age": scale_age(src.get("max_ma"), ageunits, "pbdb"),
+                        "min_age": scale_age(src.get("min_ma"), ageunits, "pbdb"),
+                        "source": src.get("url") or "epandda",
+                        "data_type": "ePANDDA correlated occurrence",
+                        "locale_id": (
+                            f"pbdb:col:{src.get('collection_no')}"
+                            if src.get("collection_no")
+                            else None
+                        ),
+                        "lat": _f(src.get("lat")),
+                        "lon": _f(src.get("lng") or src.get("lon")),
+                        "elevation": None,
+                        "match_fields": group.get("fields"),
+                    }
+                )
+            else:
+                uuid = src.get("uuid") or src.get("idigbio:uuid")
+                geo = src.get("idigbio:geoPoint") or src.get("geopoint")
+                lat = lon = None
+                if isinstance(geo, dict):
+                    lat, lon = _f(geo.get("lat")), _f(geo.get("lon"))
+                elif isinstance(geo, str) and "," in geo:
+                    parts = geo.split(",")
+                    lat, lon = _f(parts[0]), _f(parts[1])
+                records.append(
+                    {
+                        "db": "epandda/idigbio",
+                        "occ_id": f"idigbio:{uuid}" if uuid else None,
+                        "taxon": src.get("dwc:scientificName") or src.get("dwc:genus"),
+                        "taxon_id": None,
+                        "max_age": None,
+                        "min_age": None,
+                        "source": src.get("url") or "epandda",
+                        "data_type": "ePANDDA correlated specimen",
+                        "locale_id": None,
+                        "lat": lat or _f(src.get("lat")),
+                        "lon": lon or _f(src.get("lon")),
+                        "elevation": None,
+                        "match_fields": group.get("fields"),
+                    }
+                )
+        for m in group.get("matches") or []:
+            if len(records) >= limit:
+                return records
+            mt = (group.get("matchType") or m.get("type") or "idigbio").lower()
+            if mt == "idigbio" or "dwc:genus" in m or "idigbio:uuid" in m:
+                uuid = m.get("uuid") or m.get("idigbio:uuid")
+                geo = m.get("idigbio:geoPoint")
+                lat = lon = None
+                if isinstance(geo, dict):
+                    lat, lon = _f(geo.get("lat")), _f(geo.get("lon"))
+                records.append(
+                    {
+                        "db": "epandda/idigbio",
+                        "occ_id": f"idigbio:{uuid}" if uuid else None,
+                        "taxon": m.get("dwc:scientificName") or m.get("dwc:genus"),
+                        "taxon_id": None,
+                        "max_age": None,
+                        "min_age": None,
+                        "source": m.get("url") or "epandda",
+                        "data_type": "ePANDDA correlated specimen",
+                        "locale_id": None,
+                        "lat": lat or _f(m.get("lat")),
+                        "lon": lon or _f(m.get("lon")),
+                        "elevation": None,
+                        "match_fields": group.get("fields"),
+                    }
+                )
+            else:
+                oid = m.get("occurrence_no")
+                records.append(
+                    {
+                        "db": "epandda/pbdb",
+                        "occ_id": f"pbdb:occ:{oid}" if oid else None,
+                        "taxon": m.get("accepted_name") or m.get("genus"),
+                        "taxon_id": None,
+                        "max_age": scale_age(m.get("max_ma"), ageunits, "pbdb"),
+                        "min_age": scale_age(m.get("min_ma"), ageunits, "pbdb"),
+                        "source": m.get("url") or "epandda",
+                        "data_type": "ePANDDA correlated occurrence",
+                        "locale_id": None,
+                        "lat": _f(m.get("lat")),
+                        "lon": _f(m.get("lng") or m.get("lon")),
+                        "elevation": None,
+                        "match_fields": group.get("fields"),
+                    }
+                )
+    return records
+
+
+def fetch_epandda_occurrences(
+    terms: str,
+    *,
+    limit: int = 100,
+    ageunits: str = "ma",
+    return_media: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """ELC-shaped occurrence rows from ePANDDA (remote or local composite)."""
+    payload, meta = fetch_epandda_raw(terms, limit=limit, return_media=return_media)
+    records = flatten_epandda_to_elc(payload, ageunits=ageunits, limit=limit)
     meta = {**meta, "record_count": len(records)}
     return records, meta
