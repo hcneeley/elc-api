@@ -3,9 +3,9 @@
 Local Earth-Life Consortium–compatible API.
 
 Composites Paleobiology Database (PBDB), Neotoma Paleoecology Database,
-(optionally) Mindat mineral data, and ePANDDA (PBDB + iDigBio) into a
-unified JSON response shaped like the original ELC API
-(https://github.com/EarthLifeConsortium/elc_api).
+Macrostrat stratigraphic units, (optionally) Mindat mineral data, and
+ePANDDA (PBDB + iDigBio) into a unified JSON response shaped like the
+original ELC API (https://github.com/EarthLifeConsortium/elc_api).
 
 Mindat requires MINDAT_API_KEY in key.env or .env (see .env.example).
 Mindat query patterns follow https://github.com/ChuBL/How-to-Use-Mindat-API
@@ -13,16 +13,19 @@ Mindat query patterns follow https://github.com/ChuBL/How-to-Use-Mindat-API
 ePANDDA docs: https://epandda.org/documentation_2.html
 When api.epandda.org is unreachable, /epandda composes PBDB + iDigBio locally.
 
+Macrostrat docs: https://macrostrat.org/api
+
 Run:
     python -m elc_server.app
     # → http://127.0.0.1:8008/api_v1/
 
 Endpoints:
-    GET /api_v1/occ        fossil occurrences (+ Mindat / ePANDDA via run=)
+    GET /api_v1/occ        fossil occurrences (+ Mindat / ePANDDA / Macrostrat via run=)
     GET /api_v1/tax        taxonomy
-    GET /api_v1/loc        locales / collections (+ Mindat localities)
+    GET /api_v1/loc        locales / collections (+ Mindat / Macrostrat)
     GET /api_v1/minerals   Mindat geomaterials search
     GET /api_v1/epandda    ePANDDA-shaped PBDB + iDigBio correlated results
+    GET /api_v1/macrostrat Macrostrat units at lat/lng
     GET /api_v1/misc/timebound   resolve geologic age bounds via PBDB
 """
 
@@ -78,16 +81,27 @@ def _run_list(run: str | None, *, default: list[str] | None = None) -> list[str]
     """
     Parse run=… into backend names.
     default: used when run is omitted (fossil endpoints → neotoma+pbdb).
-    run=all → neotoma, pbdb, epandda, and mindat (if a key is configured).
+    run=all → neotoma, pbdb, epandda, macrostrat, and mindat (if a key is configured).
     """
     if not run:
         return list(default or ["neotoma", "pbdb"])
     if run.strip().lower() == "all":
-        dbs = ["neotoma", "pbdb", "epandda"]
+        dbs = ["neotoma", "pbdb", "epandda", "macrostrat"]
         if mindat_configured():
             dbs.append("mindat")
         return dbs
     return [x.strip().lower() for x in run.split(",") if x.strip()]
+
+
+def _parse_lat_lng() -> tuple[float | None, float | None]:
+    lat_raw = request.args.get("lat")
+    lng_raw = request.args.get("lng") or request.args.get("lon")
+    if lat_raw is None or lng_raw is None:
+        return None, None
+    try:
+        return float(lat_raw), float(lng_raw)
+    except (TypeError, ValueError):
+        return None, None
 
 
 def _base_meta(ageunits: str, coordtype: str, includelower: bool) -> dict[str, Any]:
@@ -121,7 +135,7 @@ def save_last_occurrences(payload: dict[str, Any]) -> None:
 @app.get("/api_v1/")
 @app.get("/api_v1")
 def index():
-    backends = ["pbdb", "neotoma", "epandda"]
+    backends = ["pbdb", "neotoma", "epandda", "macrostrat"]
     if mindat_configured():
         backends.append("mindat")
     return jsonify(
@@ -139,6 +153,8 @@ def index():
                 "mindat_localities": "/api_v1/loc?taxon=quartz&run=mindat&limit=20",
                 "epandda": "/api_v1/epandda?terms=hadrosaurus&limit=25",
                 "epandda_via_occ": "/api_v1/occ?taxon=hadrosaurus&run=epandda&limit=25",
+                "macrostrat": "/api_v1/macrostrat?lat=43.07&lng=-89.4&limit=20",
+                "macrostrat_via_loc": "/api_v1/loc?lat=43.07&lng=-89.4&run=macrostrat",
                 "timebound": "/api_v1/misc/timebound?agerange=pleistocene",
             },
         }
@@ -148,12 +164,29 @@ def index():
 @app.get("/api_v1/occ")
 def occurrences():
     taxon = request.args.get("taxon")
-    if not taxon:
+    run_raw = request.args.get("run")
+    lat, lng = _parse_lat_lng()
+    point_macro = lat is not None and lng is not None and not taxon
+    if point_macro and not run_raw:
+        dbs = ["macrostrat"]
+    else:
+        dbs = _run_list(run_raw)
+
+    if not taxon and "macrostrat" not in dbs:
         return jsonify(
             {
                 "type": "about:blank",
                 "title": "Bad Request",
-                "detail": "Parameter required: taxon (or use bbox/agerange in a fuller port)",
+                "detail": "Parameter required: taxon (or lat+lng with run=macrostrat)",
+                "status": 400,
+            }
+        ), 400
+    if not taxon and (lat is None or lng is None):
+        return jsonify(
+            {
+                "type": "about:blank",
+                "title": "Bad Request",
+                "detail": "Parameter required: taxon (or lat+lng with run=macrostrat)",
                 "status": 400,
             }
         ), 400
@@ -167,13 +200,12 @@ def occurrences():
     limit = abs(int(request.args.get("limit") or DEFAULT_LIMIT))
     show = (request.args.get("show") or "all").lower()
     agerange = request.args.get("agerange")
-    dbs = _run_list(request.args.get("run"))
 
     records: list[dict[str, Any]] = []
     meta = _base_meta(ageunits, coordtype, includelower)
     errors: dict[str, str] = {}
 
-    if "pbdb" in dbs:
+    if "pbdb" in dbs and taxon:
         try:
             rows, m = adapters.fetch_pbdb_occurrences(
                 taxon,
@@ -188,7 +220,7 @@ def occurrences():
             errors["pbdb"] = str(exc)
             meta["pbdb"] = {"record_count": 0, "error": str(exc)}
 
-    if "neotoma" in dbs:
+    if "neotoma" in dbs and taxon:
         try:
             rows, m = adapters.fetch_neotoma_occurrences(
                 taxon,
@@ -203,7 +235,7 @@ def occurrences():
             errors["neotoma"] = str(exc)
             meta["neotoma"] = {"record_count": 0, "error": str(exc)}
 
-    if "mindat" in dbs:
+    if "mindat" in dbs and taxon:
         if not mindat_configured():
             meta["mindat"] = {
                 "record_count": 0,
@@ -219,7 +251,7 @@ def occurrences():
                 errors["mindat"] = str(exc)
                 meta["mindat"] = {"record_count": 0, "error": str(exc)}
 
-    if "epandda" in dbs:
+    if "epandda" in dbs and taxon:
         try:
             rows, m = adapters.fetch_epandda_occurrences(
                 taxon, limit=limit, ageunits=ageunits
@@ -229,6 +261,23 @@ def occurrences():
         except Exception as exc:  # noqa: BLE001
             errors["epandda"] = str(exc)
             meta["epandda"] = {"record_count": 0, "error": str(exc)}
+
+    if "macrostrat" in dbs:
+        if lat is None or lng is None:
+            meta["macrostrat"] = {
+                "record_count": 0,
+                "note": "Provide lat and lng (or lon) to query Macrostrat units",
+            }
+        else:
+            try:
+                rows, m = adapters.fetch_macrostrat_occurrences(
+                    lat, lng, limit=limit, ageunits=ageunits
+                )
+                records.extend(rows)
+                meta["macrostrat"] = m
+            except Exception as exc:  # noqa: BLE001
+                errors["macrostrat"] = str(exc)
+                meta["macrostrat"] = {"record_count": 0, "error": str(exc)}
 
     if errors:
         meta["errors"] = errors
@@ -241,6 +290,8 @@ def occurrences():
             "limit": limit,
             "run": dbs,
             "agerange": agerange,
+            "lat": lat,
+            "lng": lng,
         },
         len(records),
     )
@@ -298,21 +349,29 @@ def locales():
     ageunits = (request.args.get("ageunits") or DEFAULT_AGEUNITS).lower()
     limit = abs(int(request.args.get("limit") or DEFAULT_LIMIT))
     agerange = request.args.get("agerange")
-    dbs = _run_list(request.args.get("run"))
+    run_raw = request.args.get("run")
+    lat, lng = _parse_lat_lng()
     show = (request.args.get("show") or "all").lower()
 
-    if not taxon and not agerange:
+    point_only = lat is not None and lng is not None and not taxon and not agerange
+    if not taxon and not agerange and not point_only:
         return jsonify(
             {
-                "detail": "Provide taxon and/or agerange",
+                "detail": "Provide taxon, agerange, and/or lat+lng (for Macrostrat)",
                 "status": 400,
             }
         ), 400
 
+    # Point queries without an explicit run= default to Macrostrat only
+    if point_only and not run_raw:
+        dbs = ["macrostrat"]
+    else:
+        dbs = _run_list(run_raw)
+
     records: list[dict[str, Any]] = []
     meta = _base_meta(ageunits, "modern", True)
 
-    if "pbdb" in dbs:
+    if "pbdb" in dbs and (taxon or agerange):
         try:
             rows, m = adapters.fetch_pbdb_locales(
                 taxon, limit=limit, ageunits=ageunits, agerange=agerange
@@ -345,8 +404,63 @@ def locales():
             except Exception as exc:  # noqa: BLE001
                 meta["mindat"] = {"record_count": 0, "error": str(exc)}
 
+    if "macrostrat" in dbs:
+        if lat is None or lng is None:
+            meta["macrostrat"] = {
+                "record_count": 0,
+                "note": "Provide lat and lng (or lon) to query Macrostrat units",
+            }
+        else:
+            try:
+                rows, m = adapters.fetch_macrostrat_locales(
+                    lat, lng, limit=limit, ageunits=ageunits
+                )
+                records.extend(rows)
+                meta["macrostrat"] = m
+            except Exception as exc:  # noqa: BLE001
+                meta["macrostrat"] = {"record_count": 0, "error": str(exc)}
+
     if show == "poll":
         return jsonify(meta)
+    return jsonify(metadata=meta, records=records)
+
+
+@app.get("/api_v1/macrostrat")
+def macrostrat():
+    """
+    Macrostrat stratigraphic units at a lat/lng.
+    Docs: https://macrostrat.org/api
+    """
+    lat, lng = _parse_lat_lng()
+    if lat is None or lng is None:
+        return jsonify(
+            {
+                "detail": "Parameters required: lat and lng (or lon)",
+                "status": 400,
+                "example": "/api_v1/macrostrat?lat=43.07&lng=-89.4&limit=20",
+                "docs": "https://macrostrat.org/api",
+            }
+        ), 400
+
+    ageunits = (request.args.get("ageunits") or DEFAULT_AGEUNITS).lower()
+    if ageunits not in {"ma", "ka", "ybp"}:
+        return jsonify({"detail": "ageunits must be ma|ka|ybp", "status": 400}), 400
+    limit = abs(int(request.args.get("limit") or DEFAULT_LIMIT))
+
+    try:
+        records, m = adapters.fetch_macrostrat_units(
+            lat, lng, limit=limit, ageunits=ageunits
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"detail": str(exc), "status": 502}), 502
+
+    meta = _base_meta(ageunits, "modern", False)
+    meta["macrostrat"] = m
+    append_request_log(
+        "/api_v1/macrostrat",
+        {"lat": lat, "lng": lng, "limit": limit, "ageunits": ageunits},
+        len(records),
+    )
     return jsonify(metadata=meta, records=records)
 
 

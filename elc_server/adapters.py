@@ -1,4 +1,4 @@
-"""Fetch + normalize records from PBDB, Neotoma, Mindat, and ePANDDA into ELC-shaped objects."""
+"""Fetch + normalize records from PBDB, Neotoma, Mindat, ePANDDA, and Macrostrat into ELC-shaped objects."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from .env import mindat_api_key
 PBDB_BASE = "https://paleobiodb.org/data1.2/"
 NEOTOMA_BASE = "https://api.neotomadb.org/v2.0/data/"
 MINDAT_BASE = "https://api.mindat.org/v1/"
+MACROSTRAT_BASE = "https://macrostrat.org/api/v2/"
 # Official host (often DNS-dead); we fall back to a local PBDB + iDigBio composite.
 EPANDDA_BASE = "https://api.epandda.org/"
 IDIGBIO_BASE = "https://search.idigbio.org/v2/"
@@ -1140,3 +1141,168 @@ def fetch_epandda_occurrences(
     records = flatten_epandda_to_elc(payload, ageunits=ageunits, limit=limit)
     meta = {**meta, "record_count": len(records)}
     return records, meta
+
+
+# ---------------------------------------------------------------------------
+# Macrostrat (stratigraphic units by location)
+# Docs: https://macrostrat.org/api
+# ---------------------------------------------------------------------------
+
+
+def _macrostrat_primary_lith(unit: dict[str, Any]) -> str | None:
+    liths = unit.get("lith") or []
+    if not liths:
+        return None
+    best = max(liths, key=lambda L: L.get("prop") or 0)
+    return best.get("name")
+
+
+def _macrostrat_primary_environ(unit: dict[str, Any]) -> str | None:
+    envs = unit.get("environ") or []
+    if not envs:
+        return None
+    return envs[0].get("name")
+
+
+def fetch_macrostrat_units(
+    lat: float,
+    lng: float,
+    *,
+    limit: int = 100,
+    ageunits: str = "ma",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Macrostrat /units at a lat/lng, normalized for this API.
+    Ages are native Ma (same as PBDB) then scaled to ageunits.
+    """
+    t0 = time()
+    params: dict[str, Any] = {
+        "lat": lat,
+        "lng": lng,
+        "response": "long",
+        "format": "json",
+    }
+    data, subquery = _get(MACROSTRAT_BASE + "units", params)
+    raw = (data.get("success") or {}).get("data") or []
+    if not isinstance(raw, list):
+        raise ValueError("Unexpected Macrostrat /units response shape")
+
+    records: list[dict[str, Any]] = []
+    for unit in raw[:limit]:
+        uid = unit.get("unit_id")
+        name = (
+            unit.get("strat_name_long")
+            or unit.get("unit_name")
+            or (f"unit {uid}" if uid is not None else None)
+        )
+        records.append(
+            {
+                "db": "macrostrat",
+                "unit_id": f"macrostrat:unit:{uid}" if uid is not None else None,
+                "locale_id": (
+                    f"macrostrat:col:{unit.get('col_id')}"
+                    if unit.get("col_id") is not None
+                    else None
+                ),
+                "locale_name": name,
+                "unit_name": unit.get("unit_name"),
+                "strat_name_long": unit.get("strat_name_long"),
+                "max_age": scale_age(unit.get("b_age"), ageunits, "pbdb"),
+                "min_age": scale_age(unit.get("t_age"), ageunits, "pbdb"),
+                "b_int_name": unit.get("b_int_name"),
+                "t_int_name": unit.get("t_int_name"),
+                "lithology": _macrostrat_primary_lith(unit),
+                "environment": _macrostrat_primary_environ(unit),
+                "max_thick": unit.get("max_thick"),
+                "min_thick": unit.get("min_thick"),
+                "pbdb_collections": unit.get("pbdb_collections"),
+                "pbdb_occurrences": unit.get("pbdb_occurrences"),
+                "lat": _f(unit.get("clat")),
+                "lon": _f(unit.get("clng")),
+                "col_id": unit.get("col_id"),
+                "section_id": unit.get("section_id"),
+                "color": unit.get("color"),
+                "data_type": "stratigraphic unit",
+                "source": "macrostrat.org",
+            }
+        )
+
+    meta = {
+        "subquery": subquery,
+        "response_time": round(time() - t0, 3),
+        "record_count": len(records),
+        "lat": lat,
+        "lng": lng,
+    }
+    return records, meta
+
+
+def fetch_macrostrat_locales(
+    lat: float,
+    lng: float,
+    *,
+    limit: int = 100,
+    ageunits: str = "ma",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """ELC /loc-shaped rows from Macrostrat units at a point."""
+    units, meta = fetch_macrostrat_units(lat, lng, limit=limit, ageunits=ageunits)
+    records = [
+        {
+            "db": "macrostrat",
+            "locale_id": u.get("unit_id"),
+            "doi": None,
+            "source": u.get("source"),
+            "locale_name": u.get("locale_name"),
+            "data_type": u.get("data_type"),
+            "occurrences_count": u.get("pbdb_occurrences"),
+            "site_id": u.get("locale_id"),
+            "max_age": u.get("max_age"),
+            "min_age": u.get("min_age"),
+            "lat": u.get("lat"),
+            "lon": u.get("lon"),
+            "elevation": None,
+            "lithology": u.get("lithology"),
+            "environment": u.get("environment"),
+        }
+        for u in units
+    ]
+    return records, {**meta, "record_count": len(records)}
+
+
+def fetch_macrostrat_occurrences(
+    lat: float,
+    lng: float,
+    *,
+    limit: int = 100,
+    ageunits: str = "ma",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Map Macrostrat units into ELC-like /occ rows (stratigraphic context at a point).
+    Prefer units that report PBDB occurrence counts when truncating.
+    """
+    units, meta = fetch_macrostrat_units(lat, lng, limit=max(limit, 50), ageunits=ageunits)
+    ranked = sorted(
+        units,
+        key=lambda u: (u.get("pbdb_occurrences") or 0),
+        reverse=True,
+    )[:limit]
+    records = [
+        {
+            "db": "macrostrat",
+            "occ_id": u.get("unit_id"),
+            "taxon": u.get("locale_name"),
+            "taxon_id": None,
+            "max_age": u.get("max_age"),
+            "min_age": u.get("min_age"),
+            "source": u.get("source"),
+            "data_type": "stratigraphic unit",
+            "locale_id": u.get("locale_id"),
+            "lat": u.get("lat"),
+            "lon": u.get("lon"),
+            "elevation": None,
+            "lithology": u.get("lithology"),
+            "pbdb_occurrences": u.get("pbdb_occurrences"),
+        }
+        for u in ranked
+    ]
+    return records, {**meta, "record_count": len(records)}
