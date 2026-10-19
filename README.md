@@ -4,6 +4,7 @@ A local recreation of the [Earth-Life Consortium API](https://github.com/EarthLi
 
 - [Paleobiology Database (PBDB)](https://paleobiodb.org/)
 - [Neotoma Paleoecology Database](https://www.neotomadb.org/)
+- [Macrostrat](https://macrostrat.org/) — stratigraphic units at a lat/lng
 - [Mindat](https://www.mindat.org/) (optional; enabled when `MINDAT_ENABLED=true` and a key is set)
 - [ePANDDA](https://epandda.org/) — correlates [PBDB](https://paleobiodb.org/) occurrences with [iDigBio](https://www.idigbio.org/) specimens
 
@@ -17,6 +18,7 @@ A local recreation of the [Earth-Life Consortium API](https://github.com/EarthLi
 | Occurrences | https://elc-api-i83q.onrender.com/api_v1/occ?taxon=canis+dirus&limit=5 |
 | Taxonomy | https://elc-api-i83q.onrender.com/api_v1/tax?taxon=canis+dirus |
 | Locales | https://elc-api-i83q.onrender.com/api_v1/loc?taxon=canis+dirus&limit=20 |
+| Macrostrat | https://elc-api-i83q.onrender.com/api_v1/macrostrat?lat=43.07&lng=-89.4&limit=10 *(on `add-epandda` after deploy)* |
 | ePANDDA | https://elc-api-i83q.onrender.com/api_v1/epandda?terms=hadrosaurus&limit=10 *(on `add-epandda` after deploy)* |
 | Time bounds | https://elc-api-i83q.onrender.com/api_v1/misc/timebound?agerange=pleistocene |
 
@@ -33,6 +35,7 @@ This service calls the following databases. Use these docs when extending querie
 | **Neotoma** | Paleoecological occurrences and taxa | [Neotoma APIv2](https://api.neotomadb.org/) · [Neotoma Database](https://www.neotomadb.org/) · [Manual / help](https://open.neotomadb.org/) |
 | **Mindat** (optional) | Minerals / geomaterials and localities | [OpenMindat API (ReDoc)](https://api.mindat.org/v1/schema/redoc/) · [How to use Mindat API](https://github.com/ChuBL/How-to-Use-Mindat-API) · [Get an API key](https://www.mindat.org/a/how_to_get_my_mindat_api_key) |
 | **ePANDDA** | Correlated PBDB occurrences + iDigBio specimens | [ePANDDA docs](https://epandda.org/documentation_2.html) · [iDigBio search API](https://github.com/iDigBio/idigbio-search-api/wiki) |
+| **Macrostrat** | Stratigraphic units (lithology, age, thickness) at a point | [Macrostrat API](https://macrostrat.org/api) |
 
 Native upstream bases used by this service:
 
@@ -40,6 +43,7 @@ Native upstream bases used by this service:
 - Neotoma: `https://api.neotomadb.org/v2.0/data/`
 - Mindat: `https://api.mindat.org/v1/` (when enabled)
 - ePANDDA: `https://api.epandda.org/` (falls back to PBDB + `https://search.idigbio.org/v2/` when the host is down)
+- Macrostrat: `https://macrostrat.org/api/v2/`
 
 ## Setup
 
@@ -65,6 +69,8 @@ curl "http://127.0.0.1:8008/api_v1/tax?taxon=canis+dirus"
 curl "http://127.0.0.1:8008/api_v1/misc/timebound?agerange=pleistocene"
 curl "http://127.0.0.1:8008/api_v1/epandda?terms=hadrosaurus&limit=10"
 curl "http://127.0.0.1:8008/api_v1/occ?taxon=hadrosaurus&run=epandda&limit=20"
+curl "http://127.0.0.1:8008/api_v1/macrostrat?lat=43.07&lng=-89.4&limit=20"
+curl "http://127.0.0.1:8008/api_v1/loc?lat=43.07&lng=-89.4"
 ```
 
 ## Test the live API
@@ -92,11 +98,12 @@ Writes summaries, CSV, and plots under `output/`.
 
 | Path | Description |
 |------|-------------|
-| `/api_v1/occ` | Fossil occurrences (PBDB + Neotoma; `run=mindat` / `run=epandda`) |
+| `/api_v1/occ` | Fossil occurrences (PBDB + Neotoma; `run=mindat` / `run=epandda` / `run=macrostrat`) |
 | `/api_v1/tax` | Taxonomy |
-| `/api_v1/loc` | Locales / collections |
+| `/api_v1/loc` | Locales / collections (or Macrostrat units via `lat`+`lng`) |
 | `/api_v1/minerals` | Mindat geomaterials (when enabled) |
 | `/api_v1/epandda` | ePANDDA-shaped PBDB + iDigBio correlated results (`terms=…`) |
+| `/api_v1/macrostrat` | Macrostrat stratigraphic units at `lat`+`lng` |
 | `/api_v1/misc/timebound` | Geologic age bounds via PBDB |
 
 ### ePANDDA
@@ -113,3 +120,13 @@ curl "http://127.0.0.1:8008/api_v1/occ?taxon=hadrosaurus&run=epandda&limit=20"
 ```
 
 If `api.epandda.org` is unreachable, this service composes the same pairing from PBDB + iDigBio directly.
+
+### Macrostrat
+
+[Macrostrat](https://macrostrat.org/) returns stacked stratigraphic units at a map point (ages in Ma, lithology, environment, PBDB counts).
+
+```bash
+curl "http://127.0.0.1:8008/api_v1/macrostrat?lat=43.07&lng=-89.4&limit=20"
+curl "http://127.0.0.1:8008/api_v1/loc?lat=43.07&lng=-89.4"
+curl "http://127.0.0.1:8008/api_v1/occ?lat=43.07&lng=-89.4&run=macrostrat&limit=20"
+```
